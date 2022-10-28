@@ -2,23 +2,25 @@
 
 namespace TheWebmen\Menustructure\Model;
 
-use SilverStripe\Assets\Image;
+use SilverStripe\Assets\File;
 use SilverStripe\CMS\Model\SiteTree;
 use SilverStripe\Control\Controller;
 use SilverStripe\Forms\DropdownField;
 use SilverStripe\Forms\GridField\GridField;
 use SilverStripe\Forms\GridField\GridFieldConfig_RecordEditor;
+use SilverStripe\Forms\TextField;
 use SilverStripe\Forms\TreeDropdownField;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\Security\Permission;
 use Symbiote\GridFieldExtensions\GridFieldOrderableRows;
 use UncleCheese\DisplayLogic\Forms\Wrapper;
 
-class MenuItem extends DataObject {
-
+class MenuItem extends DataObject
+{
     private static $link_types = [
         'page' => 'Page',
         'url' => 'URL',
+        'file' => 'File',
         'no-link' => 'Not linked'
     ];
 
@@ -29,11 +31,13 @@ class MenuItem extends DataObject {
         'LinkType' => 'Varchar',
         'Url' => 'Varchar(255)',
         'OpenInNewWindow' => 'Boolean',
-        'Sort' => 'Int'
+        'Sort' => 'Int',
+        'AnchorText' => 'Varchar',
+        'QueryString' => 'Varchar',
     ];
 
     private static $has_one = [
-        'Image' => Image::class,
+        'File' => File::class,
         'Menu' => Menu::class,
         'ParentItem' => MenuItem::class,
         'LinkedPage' => SiteTree::class
@@ -43,65 +47,118 @@ class MenuItem extends DataObject {
         'Items' => MenuItem::class
     ];
 
+    private static $owns = [
+        'File'
+    ];
+
     private static $summary_fields = [
         'Title',
         'LinkType',
-        'OpenInNewWindow'
+        'OpenInNewWindow',
     ];
 
     private static $default_sort = 'Sort';
+
+    private static $enable_page_anchor = false;
+
+    private static $enable_query_string = false;
 
     /**
      * @return \SilverStripe\Forms\FieldList
      */
     public function getCMSFields()
     {
-        $fields = parent::getCMSFields();
+        $this->beforeUpdateCMSFields(function ($fields) {
+            $fields->removeByName('Sort');
+            $fields->removeByName('ParentItemID');
+            $fields->removeByName('MenuID');
 
-        $fields->removeByName('Sort');
-        $fields->removeByName('ParentItemID');
-        $fields->removeByName('MenuID');
+            $fields->replaceField('LinkType', DropdownField::create('LinkType', $this->fieldLabel('LinkType'), $this->getLinkTypes()));
+            $fields->replaceField('LinkedPageID', $linkedPageWrapper = Wrapper::create(TreeDropdownField::create('LinkedPageID', $this->fieldLabel('LinkedPage'), SiteTree::class)));
 
-        $fields->replaceField('LinkType', DropdownField::create('LinkType', $this->fieldLabel('LinkType'), self::$link_types));
-        $fields->replaceField('LinkedPageID', $linkedPageWrapper = Wrapper::create(TreeDropdownField::create('LinkedPageID', $this->fieldLabel('LinkedPage'), SiteTree::class)));
+            $linkedPageWrapper->displayIf('LinkType')->isEqualTo('page');
+            $fields->dataFieldByName('File')->displayIf('LinkType')->isEqualTo('file');
+            $fields->dataFieldByName('Url')->displayIf('LinkType')->isEqualTo('url');
+            $fields->dataFieldByName('OpenInNewWindow')->displayIf('LinkType')->isEqualTo('page')->orIf('LinkType')->isEqualTo('url')->orIf('LinkType')->isEqualTo('file');
 
-        $linkedPageWrapper->displayIf('LinkType')->isEqualTo('page');
-        $fields->dataFieldByName('Url')->displayIf('LinkType')->isEqualTo('url');
-        $fields->dataFieldByName('OpenInNewWindow')->hideIf('LinkType')->isEqualTo('no-link');
+            if (self::config()->enable_query_string) {
+                /** @var TextField $queryStringField */
+                $queryStringField = $fields->dataFieldByName('QueryString');
+                $queryStringField->displayIf('LinkType')->isEqualTo('page');
+                $queryStringField->setDescription('Example: <code>foo=bar&john=doe</code>');
+                $fields->addFieldToTab('Root.Main', $queryStringField);
+            } else {
+                $fields->removeByName('QueryString');
+            }
 
-        $fields->addFieldToTab('Root.Main', $fields->dataFieldByName('OpenInNewWindow'));
-        $fields->addFieldToTab('Root.Main', $fields->dataFieldByName('Image')->setFolderName('Menus')->setDescription('Optional image, can be used in some templates.'));
+            if (self::config()->enable_page_anchor) {
+                $fields->dataFieldByName('AnchorText')->displayIf('LinkType')->isEqualTo('page');
+                $fields->addFieldToTab('Root.Main', $fields->dataFieldByName('AnchorText'));
+            } else {
+                $fields->removeByName('AnchorText');
+            }
 
-        $fields->removeByName('Items');
-        if($this->exists()){
-            $gridConfig = new GridFieldConfig_RecordEditor();
-            $gridConfig->addComponent(GridFieldOrderableRows::create());
-            $fields->addFieldToTab('Root.Main', GridField::create('Items', 'Items', $this->Items(), $gridConfig));
-        }
+            $fields->addFieldToTab('Root.Main', $fields->dataFieldByName('OpenInNewWindow'));
 
-        return $fields;
+            $fields->removeByName('Items');
+            if ($this->exists()) {
+                $gridConfig = new GridFieldConfig_RecordEditor();
+                $gridConfig->addComponent(GridFieldOrderableRows::create());
+                $fields->addFieldToTab('Root.Main', GridField::create('Items', 'Items', $this->Items(), $gridConfig));
+            }
+        });
+
+        return parent::getCMSFields();
+    }
+
+    private function getLinkTypes()
+    {
+        $linkTypes = self::$link_types;
+        $this->extend('updateLinkTypes', $linkTypes);
+        return $linkTypes;
     }
 
     /**
      * @return bool|mixed
      */
-    public function getLink(){
+    public function getLink()
+    {
         switch ($this->LinkType) {
             case 'url':
-                return $this->Url;
+                $link = $this->Url;
                 break;
             case 'page':
-                return $this->LinkedPage()->Link();
+                $link = $this->LinkedPage()->Link();
+
+                if (self::config()->enable_query_string && $this->QueryString) {
+                    $link = sprintf('%s?%s', $link, $this->QueryString);
+                }
+
+                if (self::config()->enable_page_anchor && $this->AnchorText) {
+                    $link = sprintf('%s#%s', $link, $this->AnchorText);
+                }
+
+                break;
+            case 'file':
+                $link = $this->File()->Link();
                 break;
         }
+
+        if (isset($link)) {
+            $this->extend('updateLink', $link);
+
+            return $link;
+        }
+
         return false;
     }
 
     /**
      * @return string
      */
-    public function LinkingMode(){
-        if($this->LinkType == 'page'){
+    public function LinkingMode()
+    {
+        if ($this->LinkType == 'page') {
             return Controller::curr()->ID == $this->LinkedPageID ? 'current' : 'link';
         }
         return 'link';
@@ -160,26 +217,14 @@ class MenuItem extends DataObject {
         return parent::canDelete($member);
     }
 
-    protected function onAfterWrite()
-    {
-        parent::onAfterWrite();
-
-        $image = $this->Image();
-
-        if ($image && $image->exists() && !$image->isPublished()) {
-            $image->doPublish();
-        }
-    }
-
     /**
      * Recursive delete
      */
     public function onBeforeDelete()
     {
         parent::onBeforeDelete();
-        foreach($this->Items() as $item){
+        foreach ($this->Items() as $item) {
             $item->delete();
         }
     }
-
 }
